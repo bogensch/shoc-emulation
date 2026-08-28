@@ -1,0 +1,5 @@
+python3 train_emulator.py --config configs/baseline_mlp.yaml
+
+# For run with column context
+python3 train_emulator.py --config configs/column_context.yaml
+

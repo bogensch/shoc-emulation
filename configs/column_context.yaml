@@ -1,0 +1,58 @@
+experiment_name: cass_w2_w3_column_context
+
+data:
+  sample_mode: column
+  input_path: /p/lustre5/bogensch/ERF_shcu_ensemble/shcu_50m_20000724/post_processed_output/training_inputs_coarse_grained.3.2km.nc
+  target_path: /p/lustre5/bogensch/ERF_shcu_ensemble/shcu_50m_20000724/post_processed_output/training_targets_coarse_grained_3.2km.nc
+  predictor_3d:
+    - theta_liq
+    - qt
+    - qc
+    - rho
+    - pressure
+    - u_wind
+    - v_wind
+  predictor_2d:
+    - shf
+    - lhf
+  derived_predictors:
+    - height_m
+    - height_norm
+    - dtheta_liq_dz
+    - dqt_dz
+    - du_wind_dz
+    - dv_wind_dz
+  targets:
+    - w_prime_2
+    - w_prime_3
+  target_transforms:
+    w_prime_2: log1p_standardize
+    w_prime_3: standardize
+
+split:
+  train_fraction: 0.70
+  val_fraction: 0.15
+  test_fraction: 0.15
+
+model:
+  type: column_conv
+  hidden_channels: [64, 64, 64, 32]
+  kernel_size: 7
+  activation: gelu
+  dropout: 0.05
+
+training:
+  seed: 7
+  batch_size: 256
+  epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  early_stopping_patience: 10
+  output_root: outputs
+
+importance:
+  enabled: true
+  split: val
+  repeats: 3
+  max_samples: 2000
+  seed: 17

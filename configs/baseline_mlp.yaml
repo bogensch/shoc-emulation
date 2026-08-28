@@ -1,0 +1,59 @@
+experiment_name: cass_w2_w3_baseline
+
+data:
+  sample_mode: pointwise
+  input_path: /p/lustre5/bogensch/ERFruns/CASS_100m_training_test_001a/post_processed_output/training_inputs_coarse_grained.3.2km.nc
+  target_path: /p/lustre5/bogensch/ERFruns/CASS_100m_training_test_001a/post_processed_output/training_targets_coarse_grained_3.2km.nc
+  predictor_3d:
+    - theta_liq
+    - qt
+    - qc
+    - rho
+    - pressure
+    - u_wind
+    - v_wind
+    - c_frac
+  predictor_2d:
+    - shf
+    - lhf
+  derived_predictors:
+    - height_m
+    - height_norm
+    - dtheta_liq_dz
+    - dqt_dz
+    - du_wind_dz
+    - dv_wind_dz
+  targets:
+    - w_prime_2
+    - w_prime_3
+  target_transforms:
+    w_prime_2: log1p_standardize
+    w_prime_3: standardize
+
+split:
+  train_fraction: 0.70
+  val_fraction: 0.15
+  test_fraction: 0.15
+
+model:
+  type: mlp
+  hidden_dims: [256, 256, 128]
+  activation: gelu
+  dropout: 0.05
+
+
+training:
+  seed: 7
+  batch_size: 8192
+  epochs: 40
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  early_stopping_patience: 8
+  output_root: outputs
+
+importance:
+  enabled: true
+  split: val
+  repeats: 3
+  max_samples: 50000
+  seed: 17
