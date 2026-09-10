@@ -3,3 +3,6 @@ python3 train_emulator.py --config configs/baseline_mlp.yaml
 # For run with column context
 python3 train_emulator.py --config configs/column_context.yaml
 
+# Default configs auto-discover all shcu_50m_YYYYMMDD cases under
+# /p/lustre5/bogensch/ERF_shcu_ensemble and split days 75/12.5/12.5.
+# To add/remove days, edit data.days or data.exclude_days in the YAML config.

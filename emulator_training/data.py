@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -35,6 +36,14 @@ class PreparedData:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ResolvedCase:
+    day: str
+    case_name: str
+    input_path: Path
+    target_path: Path
+
+
 def load_datasets(input_path: str | Path, target_path: str | Path) -> tuple[xr.Dataset, xr.Dataset]:
     inputs = xr.open_dataset(input_path)
     targets = xr.open_dataset(target_path)
@@ -48,6 +57,12 @@ def load_datasets(input_path: str | Path, target_path: str | Path) -> tuple[xr.D
 
 
 def prepare_dataset(config: dict[str, Any], max_samples_per_split: int | None = None) -> PreparedData:
+    if "ensemble_root" in config["data"]:
+        return prepare_multi_day_dataset(config, max_samples_per_split=max_samples_per_split)
+    return prepare_single_file_dataset(config, max_samples_per_split=max_samples_per_split)
+
+
+def prepare_single_file_dataset(config: dict[str, Any], max_samples_per_split: int | None = None) -> PreparedData:
     data_cfg = config["data"]
     split_cfg = config["split"]
     seed = int(config["training"]["seed"])
@@ -121,6 +136,361 @@ def prepare_dataset(config: dict[str, Any], max_samples_per_split: int | None = 
         target_names=target_names,
         metadata=metadata,
     )
+
+
+def prepare_multi_day_dataset(config: dict[str, Any], max_samples_per_split: int | None = None) -> PreparedData:
+    data_cfg = config["data"]
+    split_cfg = config["split"]
+    sample_mode = data_cfg.get("sample_mode", "pointwise")
+    split_seed = int(split_cfg.get("seed", config["training"]["seed"]))
+    rng = np.random.default_rng(split_seed)
+
+    cases = discover_case_datasets(data_cfg)
+    split_days = build_day_splits(
+        days=[case.day for case in cases],
+        train_fraction=float(split_cfg["train_fraction"]),
+        val_fraction=float(split_cfg["val_fraction"]),
+        test_fraction=float(split_cfg["test_fraction"]),
+        seed=split_seed,
+        shuffle_days=bool(split_cfg.get("shuffle_days", True)),
+    )
+    day_to_split = {day: split_name for split_name, days in split_days.items() for day in days}
+
+    split_members: dict[str, list[SplitArrays]] = {"train": [], "val": [], "test": []}
+    split_case_names: dict[str, list[str]] = {"train": [], "val": [], "test": []}
+    times_per_day: dict[str, int] = {}
+    feature_names: list[str] | None = None
+    target_names = list(data_cfg["targets"])
+    height_levels_m: np.ndarray | None = None
+    reference_sizes: dict[str, int] | None = None
+    reference_height: np.ndarray | None = None
+
+    for day_index, case in enumerate(cases):
+        inputs, targets = load_datasets(case.input_path, case.target_path)
+        try:
+            current_sizes = {dim: int(inputs.sizes[dim]) for dim in ("z", "y", "x")}
+            current_height = inputs["height"].values.astype(np.float32, copy=False)
+
+            if reference_sizes is None:
+                reference_sizes = current_sizes
+                reference_height = np.array(current_height, copy=True)
+                height_levels_m = current_height.astype(np.float32, copy=False)
+            else:
+                if current_sizes != reference_sizes:
+                    raise ValueError(
+                        f"Case {case.case_name} has grid sizes {current_sizes}, expected {reference_sizes}."
+                    )
+                if not np.allclose(current_height, reference_height):
+                    raise ValueError(f"Case {case.case_name} has height levels that differ from the reference grid.")
+
+            feature_arrays, current_feature_names = build_feature_arrays(
+                inputs=inputs,
+                predictor_3d=data_cfg["predictor_3d"],
+                predictor_2d=data_cfg["predictor_2d"],
+                derived_predictors=data_cfg["derived_predictors"],
+            )
+            if feature_names is None:
+                feature_names = current_feature_names
+            elif current_feature_names != feature_names:
+                raise ValueError(f"Case {case.case_name} resolved a different feature ordering.")
+
+            target_arrays = [targets[name].values.astype(np.float32, copy=False) for name in target_names]
+            raw_features = np.stack(feature_arrays, axis=-1)
+            raw_targets = np.stack(target_arrays, axis=-1)
+
+            if sample_mode == "pointwise":
+                prepared = flatten_pointwise_case(
+                    inputs=inputs,
+                    raw_features=raw_features,
+                    raw_targets=raw_targets,
+                    day_index=day_index,
+                    day_name=case.day,
+                )
+            elif sample_mode == "column":
+                prepared = flatten_column_case(
+                    inputs=inputs,
+                    raw_features=raw_features,
+                    raw_targets=raw_targets,
+                    day_index=day_index,
+                    day_name=case.day,
+                )
+            else:
+                raise ValueError(f"Unsupported sample_mode {sample_mode!r}.")
+
+            split_name = day_to_split[case.day]
+            split_members[split_name].append(prepared)
+            split_case_names[split_name].append(case.case_name)
+            times_per_day[case.day] = int(inputs.sizes["time"])
+        finally:
+            inputs.close()
+            targets.close()
+
+    train = concatenate_split_arrays(split_members["train"], max_samples_per_split, rng)
+    val = concatenate_split_arrays(split_members["val"], max_samples_per_split, rng)
+    test = concatenate_split_arrays(split_members["test"], max_samples_per_split, rng)
+
+    metadata = {
+        "dataset_mode": "multi_day",
+        "sample_mode": sample_mode,
+        "num_days": len(cases),
+        "num_levels": int(reference_sizes["z"]) if reference_sizes is not None else None,
+        "num_y": int(reference_sizes["y"]) if reference_sizes is not None else None,
+        "num_x": int(reference_sizes["x"]) if reference_sizes is not None else None,
+        "height_levels_m": height_levels_m.astype(float).tolist() if height_levels_m is not None else [],
+        "feature_names": feature_names,
+        "target_names": target_names,
+        "ensemble_root": str(data_cfg["ensemble_root"]),
+        "case_prefix": str(data_cfg.get("case_prefix", "shcu_50m_")),
+        "input_filename": str(data_cfg.get("input_filename", "training_inputs_coarse_grained.3.2km.nc")),
+        "target_filename": str(data_cfg.get("target_filename", "training_targets_coarse_grained_3.2km.nc")),
+        "days": [case.day for case in cases],
+        "case_names": [case.case_name for case in cases],
+        "case_directories": [str(case.input_path.parent.parent) for case in cases],
+        "times_per_day": times_per_day,
+        "split_method": "day",
+        "split_seed": split_seed,
+        "shuffle_days": bool(split_cfg.get("shuffle_days", True)),
+        "split_days": split_days,
+        "split_case_names": split_case_names,
+        "split_day_counts": {name: len(days) for name, days in split_days.items()},
+        "split_sample_counts": {
+            "train": int(len(train.features)),
+            "val": int(len(val.features)),
+            "test": int(len(test.features)),
+        },
+    }
+
+    return PreparedData(
+        train=train,
+        val=val,
+        test=test,
+        feature_names=feature_names or [],
+        target_names=target_names,
+        metadata=metadata,
+    )
+
+
+def discover_case_datasets(data_cfg: dict[str, Any]) -> list[ResolvedCase]:
+    root = Path(data_cfg["ensemble_root"])
+    if not root.is_dir():
+        raise FileNotFoundError(f"Ensemble root was not found: {root}")
+
+    case_prefix = str(data_cfg.get("case_prefix", "shcu_50m_"))
+    post_processed_subdir = str(data_cfg.get("post_processed_subdir", "post_processed_output"))
+    input_filename = str(data_cfg.get("input_filename", "training_inputs_coarse_grained.3.2km.nc"))
+    target_filename = str(data_cfg.get("target_filename", "training_targets_coarse_grained_3.2km.nc"))
+    excluded_days = {str(day) for day in data_cfg.get("exclude_days", [])}
+    explicit_days = data_cfg.get("days")
+    pattern = re.compile(rf"^{re.escape(case_prefix)}(\d{{8}})$")
+
+    cases: list[ResolvedCase] = []
+    if explicit_days is not None:
+        seen_days: set[str] = set()
+        for raw_day in explicit_days:
+            day = str(raw_day)
+            if day in seen_days:
+                raise ValueError(f"Duplicate day {day!r} in data.days.")
+            seen_days.add(day)
+            if day in excluded_days:
+                continue
+            case_name = f"{case_prefix}{day}"
+            input_path = root / case_name / post_processed_subdir / input_filename
+            target_path = root / case_name / post_processed_subdir / target_filename
+            if not input_path.is_file() or not target_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing training NetCDFs for requested day {day}: {input_path} and/or {target_path}"
+                )
+            cases.append(
+                ResolvedCase(
+                    day=day,
+                    case_name=case_name,
+                    input_path=input_path,
+                    target_path=target_path,
+                )
+            )
+        if not cases:
+            raise ValueError("No usable days remained after applying data.days and data.exclude_days.")
+        return cases
+
+    for path in sorted(root.iterdir()):
+        if not path.is_dir():
+            continue
+        match = pattern.match(path.name)
+        if match is None:
+            continue
+        day = match.group(1)
+        if day in excluded_days:
+            continue
+        input_path = path / post_processed_subdir / input_filename
+        target_path = path / post_processed_subdir / target_filename
+        if not input_path.is_file() or not target_path.is_file():
+            continue
+        cases.append(
+            ResolvedCase(
+                day=day,
+                case_name=path.name,
+                input_path=input_path,
+                target_path=target_path,
+            )
+        )
+
+    if not cases:
+        raise ValueError(f"No training cases with both NetCDF files were found under {root}.")
+    return cases
+
+
+def build_day_splits(
+    days: list[str],
+    train_fraction: float,
+    val_fraction: float,
+    test_fraction: float,
+    seed: int,
+    shuffle_days: bool,
+) -> dict[str, list[str]]:
+    total = train_fraction + val_fraction + test_fraction
+    if not np.isclose(total, 1.0):
+        raise ValueError(f"Split fractions must sum to 1.0, got {total:.6f}")
+    if len(days) < 3:
+        raise ValueError("Day-level train/val/test splitting requires at least three days.")
+    if len(set(days)) != len(days):
+        raise ValueError("Duplicate day labels were provided for day splitting.")
+
+    ordered_days = list(days)
+    if shuffle_days:
+        ordered_days = [ordered_days[idx] for idx in np.random.default_rng(seed).permutation(len(ordered_days))]
+
+    split_names = ("train", "val", "test")
+    counts = allocate_fractional_counts(
+        len(ordered_days),
+        fractions=np.asarray([train_fraction, val_fraction, test_fraction], dtype=np.float64),
+        split_names=split_names,
+    )
+
+    train_end = counts["train"]
+    val_end = train_end + counts["val"]
+    return {
+        "train": ordered_days[:train_end],
+        "val": ordered_days[train_end:val_end],
+        "test": ordered_days[val_end:],
+    }
+
+
+def allocate_fractional_counts(
+    total_count: int,
+    fractions: np.ndarray,
+    split_names: tuple[str, ...],
+) -> dict[str, int]:
+    raw_counts = fractions * total_count
+    counts = np.floor(raw_counts).astype(np.int32)
+    remainder = int(total_count - counts.sum())
+    priority = np.argsort(-(raw_counts - counts))
+    for idx in priority[:remainder]:
+        counts[idx] += 1
+
+    if total_count >= len(split_names):
+        for idx in np.where(counts == 0)[0]:
+            donor = int(np.argmax(counts))
+            if counts[donor] <= 1:
+                raise ValueError("Unable to allocate at least one day to each split.")
+            counts[donor] -= 1
+            counts[idx] += 1
+
+    return {name: int(counts[idx]) for idx, name in enumerate(split_names)}
+
+
+def flatten_pointwise_case(
+    inputs: xr.Dataset,
+    raw_features: np.ndarray,
+    raw_targets: np.ndarray,
+    day_index: int,
+    day_name: str,
+) -> SplitArrays:
+    time_hours = inputs["time_hours"].values.astype(np.float32)
+    height = inputs["height"].values.astype(np.float32)
+    time_index = np.arange(inputs.sizes["time"], dtype=np.int32)
+    z_index = np.arange(inputs.sizes["z"], dtype=np.int32)
+    y_index = np.arange(inputs.sizes["y"], dtype=np.int32)
+    x_index = np.arange(inputs.sizes["x"], dtype=np.int32)
+
+    mesh = np.meshgrid(time_index, z_index, y_index, x_index, indexing="ij")
+    sample_count = mesh[0].size
+    coords = {
+        "day_index": np.full(sample_count, day_index, dtype=np.int32),
+        "day_name": np.full(sample_count, day_name, dtype=f"<U{max(len(day_name), 1)}"),
+        "time_index": mesh[0].reshape(-1),
+        "z_index": mesh[1].reshape(-1),
+        "y_index": mesh[2].reshape(-1),
+        "x_index": mesh[3].reshape(-1),
+        "time_hours": time_hours[mesh[0]].reshape(-1),
+        "height_m": height[mesh[1]].reshape(-1),
+    }
+
+    flat_features = raw_features.reshape(-1, raw_features.shape[-1])
+    flat_targets = raw_targets.reshape(-1, raw_targets.shape[-1])
+
+    finite_mask = np.isfinite(flat_features).all(axis=1) & np.isfinite(flat_targets).all(axis=1)
+    flat_features = flat_features[finite_mask]
+    flat_targets = flat_targets[finite_mask]
+    coords = {name: values[finite_mask] for name, values in coords.items()}
+    return SplitArrays(features=flat_features, targets_raw=flat_targets, coords=coords)
+
+
+def flatten_column_case(
+    inputs: xr.Dataset,
+    raw_features: np.ndarray,
+    raw_targets: np.ndarray,
+    day_index: int,
+    day_name: str,
+) -> SplitArrays:
+    features = np.transpose(raw_features, (0, 2, 3, 1, 4))
+    targets = np.transpose(raw_targets, (0, 2, 3, 1, 4))
+
+    time_index = np.arange(inputs.sizes["time"], dtype=np.int32)
+    y_index = np.arange(inputs.sizes["y"], dtype=np.int32)
+    x_index = np.arange(inputs.sizes["x"], dtype=np.int32)
+    mesh = np.meshgrid(time_index, y_index, x_index, indexing="ij")
+    sample_count = mesh[0].size
+    coords = {
+        "day_index": np.full(sample_count, day_index, dtype=np.int32),
+        "day_name": np.full(sample_count, day_name, dtype=f"<U{max(len(day_name), 1)}"),
+        "time_index": mesh[0].reshape(-1),
+        "y_index": mesh[1].reshape(-1),
+        "x_index": mesh[2].reshape(-1),
+        "time_hours": inputs["time_hours"].values.astype(np.float32)[mesh[0]].reshape(-1),
+    }
+
+    flat_features = features.reshape(-1, features.shape[3], features.shape[4])
+    flat_targets = targets.reshape(-1, targets.shape[3], targets.shape[4])
+
+    finite_mask = np.isfinite(flat_features).all(axis=(1, 2)) & np.isfinite(flat_targets).all(axis=(1, 2))
+    flat_features = flat_features[finite_mask]
+    flat_targets = flat_targets[finite_mask]
+    coords = {name: values[finite_mask] for name, values in coords.items()}
+    return SplitArrays(features=flat_features, targets_raw=flat_targets, coords=coords)
+
+
+def concatenate_split_arrays(
+    members: list[SplitArrays],
+    max_samples: int | None,
+    rng: np.random.Generator,
+) -> SplitArrays:
+    if not members:
+        raise ValueError("Encountered an empty split after dataset preparation.")
+
+    features = np.concatenate([member.features for member in members], axis=0)
+    targets = np.concatenate([member.targets_raw for member in members], axis=0)
+    coords = {
+        name: np.concatenate([member.coords[name] for member in members], axis=0)
+        for name in members[0].coords
+    }
+
+    if max_samples is not None and len(features) > max_samples:
+        selection = np.sort(rng.choice(len(features), size=max_samples, replace=False))
+        features = features[selection]
+        targets = targets[selection]
+        coords = {name: values[selection] for name, values in coords.items()}
+
+    return SplitArrays(features=features, targets_raw=targets, coords=coords)
 
 
 def prepare_pointwise_splits(

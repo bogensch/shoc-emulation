@@ -48,18 +48,56 @@ Derived predictors:
 - `du_wind_dz`
 - `dv_wind_dz`
 
-## Development split
+## Multi-day dataset discovery
 
-You currently have a single CASS day. Because a day-level split is not yet
-possible, the code uses contiguous time blocks from that day:
+The default configs now discover all LES training days under:
 
-- first 70% of times: train
-- next 15%: validation
-- final 15%: test
+`/p/lustre5/bogensch/ERF_shcu_ensemble`
 
-This is only a development/debug split. Once multiple days are available, the
-split logic should be changed to split by entire days rather than by time
-windows within one day.
+Each usable day is expected at:
+
+`shcu_50m_<yyyymmdd>/post_processed_output/`
+
+with the two NetCDF files:
+
+- `training_inputs_coarse_grained.3.2km.nc`
+- `training_targets_coarse_grained_3.2km.nc`
+
+The loader scans the ensemble root, keeps only case directories that contain
+both files, and trains on the combined multi-day dataset.
+
+To curate the day set without changing code, edit the config:
+
+- leave `data.days` unset to auto-discover every usable day
+- set `data.days` to an explicit list of `yyyymmdd` values if you want a fixed subset
+- add entries to `data.exclude_days` to drop specific days from the discovered set
+
+Legacy single-file configs using `data.input_path` and `data.target_path` are
+still supported, but the shipped configs now use ensemble discovery by default.
+
+## Day-level split
+
+Train/validation/test splits are now assigned by entire LES day, not by time
+windows within the same day. The default fractions are:
+
+- 75% of days: train
+- 12.5% of days: validation
+- 12.5% of days: independent test
+
+With the current 80-day ensemble, that yields:
+
+- 60 training days
+- 10 validation days
+- 10 test days
+
+By default, days are shuffled before splitting so the partition is reproducible
+but not tied to directory sort order. The split is controlled by:
+
+- `split.shuffle_days`
+- `split.seed`
+
+The resolved day lists and sample counts for each split are written to
+`metadata.json` in every training output directory.
 
 ## Example usage
 
@@ -88,6 +126,7 @@ Artifacts are written under `outputs/` and include:
 - resolved config
 - normalization metadata
 - scalar metrics
+- split metadata including the resolved train/validation/test day lists
 - training history plot
 - mean vertical profile plots for train/validation
 - vertical-profile diagnostics in NetCDF form (`vertical_profile_diagnostics.nc`)
@@ -106,5 +145,3 @@ Artifacts are written under `outputs/` and include:
 - `configs/column_context.yaml` trains on entire coarse columns with shape
   `(z, feature)` and uses a 1-D convolutional network along height so each
   level can use neighboring vertical context.
-- Once multiple days are available, the split logic should be updated to split
-  by day rather than by time windows within a single day.

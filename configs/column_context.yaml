@@ -2,8 +2,14 @@ experiment_name: cass_w2_w3_column_context
 
 data:
   sample_mode: column
-  input_path: /p/lustre5/bogensch/ERF_shcu_ensemble/shcu_50m_20000724/post_processed_output/training_inputs_coarse_grained.3.2km.nc
-  target_path: /p/lustre5/bogensch/ERF_shcu_ensemble/shcu_50m_20000724/post_processed_output/training_targets_coarse_grained_3.2km.nc
+  ensemble_root: /p/lustre5/bogensch/ERF_shcu_ensemble
+  case_prefix: shcu_50m_
+  post_processed_subdir: post_processed_output
+  input_filename: training_inputs_coarse_grained.3.2km.nc
+  target_filename: training_targets_coarse_grained_3.2km.nc
+  # Optional controls for curating the day set:
+  # days: [19000101, 19000102]
+  exclude_days: []
   predictor_3d:
     - theta_liq
     - qt
@@ -30,9 +36,11 @@ data:
     w_prime_3: standardize
 
 split:
-  train_fraction: 0.70
-  val_fraction: 0.15
-  test_fraction: 0.15
+  train_fraction: 0.75
+  val_fraction: 0.125
+  test_fraction: 0.125
+  shuffle_days: true
+  seed: 7
 
 model:
   type: column_conv
