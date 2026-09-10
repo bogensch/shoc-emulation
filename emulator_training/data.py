@@ -44,6 +44,10 @@ class ResolvedCase:
     target_path: Path
 
 
+def log_data(message: str) -> None:
+    print(f"[DATA] {message}", flush=True)
+
+
 def load_datasets(input_path: str | Path, target_path: str | Path) -> tuple[xr.Dataset, xr.Dataset]:
     inputs = xr.open_dataset(input_path)
     targets = xr.open_dataset(target_path)
@@ -146,6 +150,7 @@ def prepare_multi_day_dataset(config: dict[str, Any], max_samples_per_split: int
     rng = np.random.default_rng(split_seed)
 
     cases = discover_case_datasets(data_cfg)
+    log_data(f"Discovered {len(cases)} usable day(s) under {data_cfg['ensemble_root']}")
     split_days = build_day_splits(
         days=[case.day for case in cases],
         train_fraction=float(split_cfg["train_fraction"]),
@@ -153,6 +158,10 @@ def prepare_multi_day_dataset(config: dict[str, Any], max_samples_per_split: int
         test_fraction=float(split_cfg["test_fraction"]),
         seed=split_seed,
         shuffle_days=bool(split_cfg.get("shuffle_days", True)),
+    )
+    log_data(
+        "Day split counts: "
+        f"train={len(split_days['train'])}, val={len(split_days['val'])}, test={len(split_days['test'])}"
     )
     day_to_split = {day: split_name for split_name, days in split_days.items() for day in days}
 
@@ -166,6 +175,8 @@ def prepare_multi_day_dataset(config: dict[str, Any], max_samples_per_split: int
     reference_height: np.ndarray | None = None
 
     for day_index, case in enumerate(cases):
+        split_name = day_to_split[case.day]
+        log_data(f"Loading day {day_index + 1}/{len(cases)}: {case.case_name} -> {split_name}")
         inputs, targets = load_datasets(case.input_path, case.target_path)
         try:
             current_sizes = {dim: int(inputs.sizes[dim]) for dim in ("z", "y", "x")}
@@ -217,17 +228,25 @@ def prepare_multi_day_dataset(config: dict[str, Any], max_samples_per_split: int
             else:
                 raise ValueError(f"Unsupported sample_mode {sample_mode!r}.")
 
-            split_name = day_to_split[case.day]
             split_members[split_name].append(prepared)
             split_case_names[split_name].append(case.case_name)
             times_per_day[case.day] = int(inputs.sizes["time"])
+            log_data(
+                f"Prepared {case.case_name}: time={inputs.sizes['time']}, "
+                f"samples={len(prepared.features)}, split={split_name}"
+            )
         finally:
             inputs.close()
             targets.close()
 
+    log_data("Concatenating split arrays")
     train = concatenate_split_arrays(split_members["train"], max_samples_per_split, rng)
     val = concatenate_split_arrays(split_members["val"], max_samples_per_split, rng)
     test = concatenate_split_arrays(split_members["test"], max_samples_per_split, rng)
+    log_data(
+        "Finished dataset assembly: "
+        f"train_samples={len(train.features)}, val_samples={len(val.features)}, test_samples={len(test.features)}"
+    )
 
     metadata = {
         "dataset_mode": "multi_day",
