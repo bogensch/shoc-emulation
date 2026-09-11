@@ -28,6 +28,10 @@ from emulator_training.data import (
 from emulator_training.model import build_model
 
 
+def log_training(message: str) -> None:
+    print(f"[TRAIN] {message}", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a baseline emulator for coarse-grained CASS LES moments.")
     parser.add_argument("--config", default="configs/baseline_mlp.yaml", help="Path to the YAML config file.")
@@ -57,8 +61,11 @@ def main() -> None:
     device = resolve_device(args.device)
 
     data = prepare_dataset(config, max_samples_per_split=args.max_samples_per_split)
+    log_training("Fitting feature and target scalers")
     scalers = fit_scalers(data, config)
+    log_training("Building standardized tensors and dataloaders")
     loaders = build_dataloaders(data, scalers, config, device)
+    log_training(f"Building model on device={device}")
 
     model = build_model(
         model_config=config["model"],
@@ -73,6 +80,7 @@ def main() -> None:
     )
     loss_fn = nn.MSELoss()
 
+    log_training("Starting optimization")
     history, best_state = train_model(
         model=model,
         train_loader=loaders["train"],
@@ -176,12 +184,15 @@ def resolve_device(requested: str) -> torch.device:
 
 
 def fit_scalers(data: PreparedData, config: dict[str, Any]) -> dict[str, Any]:
+    log_training(f"Computing feature scaler from training features with shape={data.train.features.shape}")
     feature_scaler = fit_standard_scaler(data.train.features)
+    log_training(f"Computing target transforms from training targets with shape={data.train.targets_raw.shape}")
     target_transforms = fit_target_transforms(
         raw_targets=data.train.targets_raw,
         target_names=data.target_names,
         transform_config=config["data"]["target_transforms"],
     )
+    log_training("Finished scaler fitting")
     return {"feature_scaler": feature_scaler, "target_transforms": target_transforms}
 
 
@@ -191,14 +202,31 @@ def build_dataloaders(
     config: dict[str, Any],
     device: torch.device,
 ) -> dict[str, DataLoader]:
+    training_cfg = config["training"]
     batch_size = int(config["training"]["batch_size"])
     pin_memory = device.type == "cuda"
+    shuffle_mode = str(training_cfg.get("train_shuffle_mode", "per_epoch"))
+    shuffle_seed = int(training_cfg.get("train_shuffle_seed", training_cfg.get("seed", 7)))
+
+    if shuffle_mode not in {"per_epoch", "once", "none"}:
+        raise ValueError(f"Unsupported train_shuffle_mode {shuffle_mode!r}.")
 
     loaders = {}
     for split_name in ("train", "val", "test"):
         split = getattr(data, split_name)
+        log_training(
+            f"Preparing split={split_name} features_shape={split.features.shape} targets_shape={split.targets_raw.shape}"
+        )
         features = apply_standard_scaler(split.features, scalers["feature_scaler"])
         targets = transform_targets(split.targets_raw, scalers["target_transforms"])
+
+        shuffle = split_name == "train" and shuffle_mode == "per_epoch"
+        if split_name == "train" and shuffle_mode == "once":
+            log_training(f"Applying one-time training shuffle with seed={shuffle_seed}")
+            order = np.random.default_rng(shuffle_seed).permutation(len(features))
+            features = features[order]
+            targets = targets[order]
+
         dataset = TensorDataset(
             torch.from_numpy(features.astype(np.float32)),
             torch.from_numpy(targets.astype(np.float32)),
@@ -206,9 +234,13 @@ def build_dataloaders(
         loaders[split_name] = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=(split_name == "train"),
+            shuffle=shuffle,
             num_workers=0,
             pin_memory=pin_memory,
+        )
+        log_training(
+            f"Finished split={split_name} tensor preparation with samples={len(dataset)} "
+            f"and batches={len(loaders[split_name])}"
         )
     return loaders
 

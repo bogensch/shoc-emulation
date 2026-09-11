@@ -8,7 +8,7 @@ data:
   input_filename: training_inputs_coarse_grained.3.2km.nc
   target_filename: training_targets_coarse_grained_3.2km.nc
   # Optional controls for curating the day set:
-  # days: [19000101, 19000102]
+  # days: [19000101, 19000102, 19000103]
   exclude_days: []
   predictor_3d:
     - theta_liq
@@ -52,11 +52,13 @@ model:
 
 training:
   seed: 7
-  batch_size: 8192
+  batch_size: 65536
   epochs: 40
   learning_rate: 0.001
   weight_decay: 0.0001
   early_stopping_patience: 8
+  train_shuffle_mode: once
+  train_shuffle_seed: 7
   output_root: outputs
 
 importance:
