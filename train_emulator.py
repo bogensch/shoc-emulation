@@ -415,7 +415,7 @@ def create_plots(
     fig.savefig(output_dir / "validation_metrics.png", dpi=plot_dpi)
     plt.close(fig)
 
-    plotted_splits = [split_name for split_name in ("train", "val") if split_name in profile_diagnostics]
+    plotted_splits = [split_name for split_name in ("train", "val", "test") if split_name in profile_diagnostics]
     fig, axes = plt.subplots(
         len(target_names),
         len(plotted_splits),
@@ -451,7 +451,7 @@ def create_plots(
                 ax.legend(fontsize=8)
 
     fig.tight_layout()
-    fig.savefig(output_dir / "mean_vertical_profiles_train_val.png", dpi=plot_dpi)
+    fig.savefig(output_dir / "mean_vertical_profiles_train_val_test.png", dpi=plot_dpi)
     plt.close(fig)
 
     fig, axes = plt.subplots(
@@ -485,7 +485,7 @@ def create_plots(
                 ax.legend(fontsize=8)
 
     fig.tight_layout()
-    fig.savefig(output_dir / "vertical_profile_errors_train_val.png", dpi=plot_dpi)
+    fig.savefig(output_dir / "vertical_profile_errors_train_val_test.png", dpi=plot_dpi)
     plt.close(fig)
 
     if importance_results.get("enabled", False):

@@ -99,6 +99,24 @@ but not tied to directory sort order. The split is controlled by:
 The resolved day lists and sample counts for each split are written to
 `metadata.json` in every training output directory.
 
+## Training-speed defaults
+
+The shipped configs now use `training.train_shuffle_mode: once` to randomize
+training order once up front instead of building a fresh full-dataset shuffle
+every epoch.
+
+The default batch sizes are also tuned upward to reduce optimizer steps on the
+80-day dataset:
+
+- `configs/baseline_mlp.yaml`: `training.batch_size: 65536`
+- `configs/column_context.yaml`: `training.batch_size: 1024`
+
+Supported shuffle modes are:
+
+- `per_epoch`: reshuffle the training split every epoch
+- `once`: shuffle the training split once before the first epoch
+- `none`: preserve the original sample order
+
 ## Example usage
 
 ```bash
@@ -128,7 +146,7 @@ Artifacts are written under `outputs/` and include:
 - scalar metrics
 - split metadata including the resolved train/validation/test day lists
 - training history plot
-- mean vertical profile plots for train/validation
+- mean vertical profile plots for train/validation/test
 - vertical-profile diagnostics in NetCDF form (`vertical_profile_diagnostics.nc`)
 - validation-set permutation importance in JSON form (`feature_importance.json`)
 - permutation-importance ranking plot (`feature_permutation_importance.png`)
