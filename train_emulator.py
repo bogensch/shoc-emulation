@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import textwrap
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -134,6 +135,7 @@ def main() -> None:
     })
     save_json(output_dir / "feature_importance.json", importance_results)
     write_profile_diagnostics_netcdf(output_dir / "vertical_profile_diagnostics.nc", profile_diagnostics, data)
+    write_standalone_emulator(output_dir / "standalone_emulator.py", model, scalers, data, config)
     with (output_dir / "resolved_config.yaml").open("w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)
 
@@ -366,6 +368,219 @@ def serialize_scaler(scaler: dict[str, np.ndarray]) -> dict[str, list[float]]:
 def save_json(path: Path, payload: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def write_standalone_emulator(
+    path: Path,
+    model: nn.Module,
+    scalers: dict[str, Any],
+    data: PreparedData,
+    config: dict[str, Any],
+) -> None:
+    source = build_standalone_emulator_source(model, scalers, data, config)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(source)
+    log_training(f"Wrote standalone emulator to {path}")
+
+
+def build_standalone_emulator_source(
+    model: nn.Module,
+    scalers: dict[str, Any],
+    data: PreparedData,
+    config: dict[str, Any],
+) -> str:
+    feature_mean = np.asarray(scalers["feature_scaler"]["mean"], dtype=np.float32)
+    feature_std = np.asarray(scalers["feature_scaler"]["std"], dtype=np.float32)
+    target_means = np.asarray([item["mean"] for item in scalers["target_transforms"]], dtype=np.float32)
+    target_stds = np.asarray([item["std"] for item in scalers["target_transforms"]], dtype=np.float32)
+    target_transform_names = [item["transform"] for item in scalers["target_transforms"]]
+
+    model_config = config["model"]
+    model_type = model_config["type"]
+    activation = str(model_config["activation"])
+    sample_mode = data.metadata["sample_mode"]
+
+    lines = [
+        "from __future__ import annotations",
+        "",
+        "import numpy as np",
+        "",
+        '"""Standalone emulator exported from a trained SHOC experiment."""',
+        "",
+        f"MODEL_TYPE = {model_type!r}",
+        f"SAMPLE_MODE = {sample_mode!r}",
+        f"FEATURE_NAMES = {repr(data.feature_names)}",
+        f"TARGET_NAMES = {repr(data.target_names)}",
+        f"ACTIVATION = {activation!r}",
+        f"FEATURE_MEAN = {python_array_literal(feature_mean)}",
+        f"FEATURE_STD = {python_array_literal(feature_std)}",
+        f"TARGET_MEAN = {python_array_literal(target_means)}",
+        f"TARGET_STD = {python_array_literal(target_stds)}",
+        f"TARGET_TRANSFORMS = {repr(target_transform_names)}",
+        "",
+        textwrap.dedent(
+            """
+            def _apply_activation(values: np.ndarray) -> np.ndarray:
+                if ACTIVATION == "relu":
+                    return np.maximum(values, 0.0).astype(np.float32)
+                if ACTIVATION == "gelu":
+                    coeff = np.float32(np.sqrt(2.0 / np.pi))
+                    cubic = values * values * values
+                    return (0.5 * values * (1.0 + np.tanh(coeff * (values + 0.044715 * cubic)))).astype(np.float32)
+                if ACTIVATION == "silu":
+                    return (values / (1.0 + np.exp(-values))).astype(np.float32)
+                if ACTIVATION == "tanh":
+                    return np.tanh(values).astype(np.float32)
+                raise KeyError(f"Unsupported activation {ACTIVATION!r}.")
+
+
+            def _standardize_features(features: np.ndarray) -> np.ndarray:
+                return ((features - FEATURE_MEAN) / FEATURE_STD).astype(np.float32)
+
+
+            def _restore_targets(normalized: np.ndarray) -> np.ndarray:
+                restored = normalized.astype(np.float32, copy=True)
+                restored = restored * TARGET_STD + TARGET_MEAN
+                for index, transform in enumerate(TARGET_TRANSFORMS):
+                    if transform == "standardize":
+                        continue
+                    if transform == "log1p_standardize":
+                        restored[..., index] = np.expm1(restored[..., index])
+                        continue
+                    raise KeyError(f"Unsupported target transform {transform!r}.")
+                return restored.astype(np.float32)
+
+
+            def predict_from_named_features(feature_mapping: dict[str, float]) -> dict[str, float]:
+                ordered = np.asarray([feature_mapping[name] for name in FEATURE_NAMES], dtype=np.float32)
+                prediction = predict_emulator(ordered)
+                return {name: float(prediction[index]) for index, name in enumerate(TARGET_NAMES)}
+
+
+            def predict_column_from_named_features(feature_mapping: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+                ordered = np.stack([np.asarray(feature_mapping[name], dtype=np.float32) for name in FEATURE_NAMES], axis=-1)
+                prediction = predict_emulator(ordered)
+                return {name: np.asarray(prediction[..., index], dtype=np.float32) for index, name in enumerate(TARGET_NAMES)}
+            """
+        ).strip(),
+        "",
+    ]
+
+    if model_type == "mlp":
+        lines.extend(build_exported_mlp_section(model))
+    elif model_type == "column_conv":
+        lines.extend(build_exported_column_conv_section(model))
+    else:
+        raise KeyError(f"Unsupported model type {model_type!r} for standalone export.")
+
+    return "\n".join(lines) + "\n"
+
+
+def build_exported_mlp_section(model: nn.Module) -> list[str]:
+    linear_layers = [layer for layer in model.modules() if isinstance(layer, nn.Linear)]
+    if not linear_layers:
+        raise ValueError("Expected at least one linear layer for MLP export.")
+
+    lines = []
+    for index, layer in enumerate(linear_layers):
+        lines.append(f"LINEAR_WEIGHT_{index} = {python_array_literal(layer.weight.detach().cpu().numpy())}")
+        lines.append(f"LINEAR_BIAS_{index} = {python_array_literal(layer.bias.detach().cpu().numpy())}")
+    lines.append("")
+    lines.append(
+        textwrap.dedent(
+            f"""
+            def predict_emulator(features: np.ndarray) -> np.ndarray:
+                values = np.asarray(features, dtype=np.float32)
+                single_sample = values.ndim == 1
+                if single_sample:
+                    values = values[None, :]
+                if values.shape[-1] != len(FEATURE_NAMES):
+                    raise ValueError(
+                        f"Expected the last feature dimension to have length {{len(FEATURE_NAMES)}}, "
+                        f"got {{values.shape[-1]}}."
+                    )
+
+                activations = _standardize_features(values)
+            """
+        ).strip()
+    )
+    for index in range(len(linear_layers)):
+        lines.append(f"    activations = activations @ LINEAR_WEIGHT_{index}.T + LINEAR_BIAS_{index}")
+        if index < len(linear_layers) - 1:
+            lines.append("    activations = _apply_activation(activations)")
+    lines.extend(
+        [
+            "    restored = _restore_targets(activations)",
+            "    if single_sample:",
+            "        return restored[0]",
+            "    return restored",
+            "",
+        ]
+    )
+    return lines
+
+
+def build_exported_column_conv_section(model: nn.Module) -> list[str]:
+    conv_layers = [layer for layer in model.modules() if isinstance(layer, nn.Conv1d)]
+    if not conv_layers:
+        raise ValueError("Expected at least one convolution layer for column export.")
+
+    lines = []
+    for index, layer in enumerate(conv_layers):
+        lines.append(f"CONV_WEIGHT_{index} = {python_array_literal(layer.weight.detach().cpu().numpy())}")
+        lines.append(f"CONV_BIAS_{index} = {python_array_literal(layer.bias.detach().cpu().numpy())}")
+    lines.append("")
+    lines.append(
+        textwrap.dedent(
+            """
+            def _conv1d_same(inputs: np.ndarray, weight: np.ndarray, bias: np.ndarray) -> np.ndarray:
+                kernel_size = weight.shape[-1]
+                padding = kernel_size // 2
+                padded = np.pad(inputs, ((0, 0), (padding, padding), (0, 0)), mode="constant")
+                output = np.zeros((inputs.shape[0], inputs.shape[1], weight.shape[0]), dtype=np.float32)
+                for kernel_index in range(kernel_size):
+                    output += padded[:, kernel_index:kernel_index + inputs.shape[1], :] @ weight[:, :, kernel_index].T
+                output += bias[None, None, :]
+                return output.astype(np.float32)
+
+
+            def predict_emulator(features: np.ndarray) -> np.ndarray:
+                values = np.asarray(features, dtype=np.float32)
+                single_column = values.ndim == 2
+                if single_column:
+                    values = values[None, :, :]
+                if values.ndim != 3:
+                    raise ValueError(
+                        "Column-convolution export expects shape (z, feature) or (batch, z, feature)."
+                    )
+                if values.shape[-1] != len(FEATURE_NAMES):
+                    raise ValueError(
+                        f"Expected the last feature dimension to have length {len(FEATURE_NAMES)}, "
+                        f"got {values.shape[-1]}."
+                    )
+
+                activations = _standardize_features(values)
+            """
+        ).strip()
+    )
+    for index in range(len(conv_layers)):
+        lines.append(f"    activations = _conv1d_same(activations, CONV_WEIGHT_{index}, CONV_BIAS_{index})")
+        if index < len(conv_layers) - 1:
+            lines.append("    activations = _apply_activation(activations)")
+    lines.extend(
+        [
+            "    restored = _restore_targets(activations)",
+            "    if single_column:",
+            "        return restored[0]",
+            "    return restored",
+            "",
+        ]
+    )
+    return lines
+
+
+def python_array_literal(values: np.ndarray) -> str:
+    return f"np.array({repr(np.asarray(values, dtype=np.float32).tolist())}, dtype=np.float32)"
 
 
 def create_plots(
