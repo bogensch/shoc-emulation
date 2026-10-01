@@ -703,6 +703,9 @@ def create_plots(
     fig.savefig(output_dir / "vertical_profile_errors_train_val_test.png", dpi=plot_dpi)
     plt.close(fig)
 
+    time_height_diagnostics = build_time_height_diagnostics(profile_diagnostics, target_names)
+    create_time_height_plots(output_dir, time_height_diagnostics, target_names, plot_dpi)
+
     if importance_results.get("enabled", False):
         feature_names = importance_results["feature_names"]
         fig, axes = plt.subplots(
@@ -753,8 +756,16 @@ def build_profile_diagnostics(
             rmse_profile = np.sqrt(np.mean(diff**2, axis=0))
             mae_profile = np.mean(np.abs(diff), axis=0)
             sample_count = np.full(height_levels.shape, truth.shape[0], dtype=np.int32)
+            time_height = aggregate_column_time_height_fields(
+                truth=truth,
+                prediction=prediction,
+                time_index=split.coords["time_index"].astype(np.int32),
+                time_hours=split.coords["time_hours"].astype(np.float32),
+            )
         elif sample_mode == "pointwise":
             z_index = split.coords["z_index"].astype(np.int32)
+            time_index = split.coords["time_index"].astype(np.int32)
+            time_hours = split.coords["time_hours"].astype(np.float32)
             num_levels = len(height_levels)
             num_targets = truth.shape[-1]
             truth_mean = np.full((num_levels, num_targets), np.nan, dtype=np.float32)
@@ -777,11 +788,23 @@ def build_profile_diagnostics(
                 bias_mean[level_idx] = level_diff.mean(axis=0)
                 rmse_profile[level_idx] = np.sqrt(np.mean(level_diff**2, axis=0))
                 mae_profile[level_idx] = np.mean(np.abs(level_diff), axis=0)
+            time_height = aggregate_pointwise_time_height_fields(
+                truth=truth,
+                prediction=prediction,
+                time_index=time_index,
+                time_hours=time_hours,
+                z_index=z_index,
+                num_levels=num_levels,
+            )
         else:
             raise ValueError(f"Unsupported sample_mode {sample_mode!r}.")
 
         profile_diagnostics[split_name] = {
             "height_m": height_levels,
+            "time_hours": time_height["time_hours"],
+            "truth_time_height": time_height["truth_mean"],
+            "prediction_time_height": time_height["prediction_mean"],
+            "bias_time_height": time_height["bias_mean"],
             "truth_mean": truth_mean.astype(np.float32),
             "prediction_mean": prediction_mean.astype(np.float32),
             "bias_mean": bias_mean.astype(np.float32),
@@ -791,6 +814,223 @@ def build_profile_diagnostics(
         }
 
     return profile_diagnostics
+
+
+def aggregate_column_time_height_fields(
+    truth: np.ndarray,
+    prediction: np.ndarray,
+    time_index: np.ndarray,
+    time_hours: np.ndarray,
+) -> dict[str, np.ndarray]:
+    unique_time_index = np.unique(time_index)
+    num_times = len(unique_time_index)
+    num_levels = truth.shape[1]
+    num_targets = truth.shape[2]
+
+    truth_mean = np.full((num_times, num_levels, num_targets), np.nan, dtype=np.float32)
+    prediction_mean = np.full((num_times, num_levels, num_targets), np.nan, dtype=np.float32)
+    bias_mean = np.full((num_times, num_levels, num_targets), np.nan, dtype=np.float32)
+    aggregated_time_hours = np.full(num_times, np.nan, dtype=np.float32)
+
+    for out_idx, current_time in enumerate(unique_time_index):
+        mask = time_index == current_time
+        if not np.any(mask):
+            continue
+        truth_slice = truth[mask]
+        prediction_slice = prediction[mask]
+        truth_mean[out_idx] = truth_slice.mean(axis=0)
+        prediction_mean[out_idx] = prediction_slice.mean(axis=0)
+        bias_mean[out_idx] = prediction_mean[out_idx] - truth_mean[out_idx]
+        aggregated_time_hours[out_idx] = float(np.mean(time_hours[mask]))
+
+    return {
+        "time_hours": aggregated_time_hours,
+        "truth_mean": truth_mean,
+        "prediction_mean": prediction_mean,
+        "bias_mean": bias_mean,
+    }
+
+
+def aggregate_pointwise_time_height_fields(
+    truth: np.ndarray,
+    prediction: np.ndarray,
+    time_index: np.ndarray,
+    time_hours: np.ndarray,
+    z_index: np.ndarray,
+    num_levels: int,
+) -> dict[str, np.ndarray]:
+    unique_time_index = np.unique(time_index)
+    num_times = len(unique_time_index)
+    num_targets = truth.shape[1]
+
+    truth_mean = np.full((num_times, num_levels, num_targets), np.nan, dtype=np.float32)
+    prediction_mean = np.full((num_times, num_levels, num_targets), np.nan, dtype=np.float32)
+    bias_mean = np.full((num_times, num_levels, num_targets), np.nan, dtype=np.float32)
+    aggregated_time_hours = np.full(num_times, np.nan, dtype=np.float32)
+
+    for out_idx, current_time in enumerate(unique_time_index):
+        time_mask = time_index == current_time
+        if not np.any(time_mask):
+            continue
+        aggregated_time_hours[out_idx] = float(np.mean(time_hours[time_mask]))
+        for level_idx in range(num_levels):
+            mask = time_mask & (z_index == level_idx)
+            if not np.any(mask):
+                continue
+            truth_level = truth[mask]
+            prediction_level = prediction[mask]
+            truth_mean[out_idx, level_idx] = truth_level.mean(axis=0)
+            prediction_mean[out_idx, level_idx] = prediction_level.mean(axis=0)
+            bias_mean[out_idx, level_idx] = prediction_mean[out_idx, level_idx] - truth_mean[out_idx, level_idx]
+
+    return {
+        "time_hours": aggregated_time_hours,
+        "truth_mean": truth_mean,
+        "prediction_mean": prediction_mean,
+        "bias_mean": bias_mean,
+    }
+
+
+def build_time_height_diagnostics(
+    profile_diagnostics: dict[str, dict[str, np.ndarray]],
+    target_names: list[str],
+) -> dict[str, Any]:
+    split_names = [split_name for split_name in ("train", "val", "test") if split_name in profile_diagnostics]
+    by_target: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+
+    for target_idx, target_name in enumerate(target_names):
+        target_entry: dict[str, dict[str, np.ndarray]] = {}
+        common_range_values: list[np.ndarray] = []
+        bias_range_values: list[np.ndarray] = []
+
+        for split_name in split_names:
+            diag = profile_diagnostics[split_name]
+            truth_field = diag["truth_time_height"][..., target_idx]
+            prediction_field = diag["prediction_time_height"][..., target_idx]
+            bias_field = diag["bias_time_height"][..., target_idx]
+            target_entry[split_name] = {
+                "time_hours": diag["time_hours"].astype(np.float32),
+                "height_m": diag["height_m"].astype(np.float32),
+                "truth": truth_field.astype(np.float32),
+                "prediction": prediction_field.astype(np.float32),
+                "bias": bias_field.astype(np.float32),
+            }
+            common_range_values.extend([truth_field[np.isfinite(truth_field)], prediction_field[np.isfinite(prediction_field)]])
+            bias_range_values.append(bias_field[np.isfinite(bias_field)])
+
+        common_values = np.concatenate([values for values in common_range_values if values.size > 0]) if common_range_values else np.asarray([], dtype=np.float32)
+        bias_values = np.concatenate([values for values in bias_range_values if values.size > 0]) if bias_range_values else np.asarray([], dtype=np.float32)
+
+        if common_values.size > 0:
+            common_vmin = float(np.min(common_values))
+            common_vmax = float(np.max(common_values))
+            if np.isclose(common_vmin, common_vmax):
+                common_vmax = common_vmin + 1.0e-6
+        else:
+            common_vmin, common_vmax = 0.0, 1.0
+
+        if bias_values.size > 0:
+            bias_abs = float(np.max(np.abs(bias_values)))
+            if np.isclose(bias_abs, 0.0):
+                bias_abs = 1.0e-6
+        else:
+            bias_abs = 1.0
+
+        by_target[target_name] = {
+            "splits": target_entry,
+            "common_vmin": common_vmin,
+            "common_vmax": common_vmax,
+            "bias_vmin": -bias_abs,
+            "bias_vmax": bias_abs,
+        }
+
+    return {"split_names": split_names, "by_target": by_target}
+
+
+def create_time_height_plots(
+    output_dir: Path,
+    time_height_diagnostics: dict[str, Any],
+    target_names: list[str],
+    plot_dpi: int,
+) -> None:
+    os.environ.setdefault("MPLCONFIGDIR", str(output_dir / ".mplconfig"))
+    import matplotlib.pyplot as plt
+
+    split_names = time_height_diagnostics["split_names"]
+    column_specs = (
+        ("truth", "Target"),
+        ("prediction", "ML"),
+        ("bias", "ML - target"),
+    )
+
+    for target_name in target_names:
+        target_diag = time_height_diagnostics["by_target"][target_name]
+        fig, axes = plt.subplots(
+            len(split_names),
+            len(column_specs),
+            figsize=(10.0, 2.8 * len(split_names)),
+            sharex=False,
+            sharey=True,
+            constrained_layout=False,
+        )
+        if len(split_names) == 1:
+            axes = np.array([axes])
+
+        common_mappable = None
+        bias_mappable = None
+
+        for row_idx, split_name in enumerate(split_names):
+            split_diag = target_diag["splits"][split_name]
+            time_hours = split_diag["time_hours"]
+            height_m = split_diag["height_m"]
+            time_grid, height_grid = np.meshgrid(time_hours, height_m, indexing="xy")
+
+            for col_idx, (field_name, title) in enumerate(column_specs):
+                ax = axes[row_idx, col_idx]
+                field = split_diag[field_name].T
+                if field_name == "bias":
+                    mappable = ax.pcolormesh(
+                        time_grid,
+                        height_grid,
+                        field,
+                        shading="auto",
+                        cmap="RdBu_r",
+                        vmin=target_diag["bias_vmin"],
+                        vmax=target_diag["bias_vmax"],
+                    )
+                    bias_mappable = mappable
+                else:
+                    mappable = ax.pcolormesh(
+                        time_grid,
+                        height_grid,
+                        field,
+                        shading="auto",
+                        cmap="viridis",
+                        vmin=target_diag["common_vmin"],
+                        vmax=target_diag["common_vmax"],
+                    )
+                    common_mappable = mappable
+
+                if row_idx == 0:
+                    ax.set_title(title, fontsize=10)
+                if col_idx == 0:
+                    ax.set_ylabel(f"{split_name.capitalize()}\nHeight (m)")
+                ax.set_xlabel("Time (hr)")
+
+        fig.suptitle(f"Horizontally Averaged Time Evolution: {target_name}", fontsize=12, y=0.98)
+        fig.tight_layout(rect=(0.0, 0.12, 1.0, 0.95))
+
+        common_cax = fig.add_axes([0.12, 0.06, 0.50, 0.025])
+        bias_cax = fig.add_axes([0.70, 0.06, 0.20, 0.025])
+        if common_mappable is not None:
+            common_cbar = fig.colorbar(common_mappable, cax=common_cax, orientation="horizontal")
+            common_cbar.set_label(target_name)
+        if bias_mappable is not None:
+            bias_cbar = fig.colorbar(bias_mappable, cax=bias_cax, orientation="horizontal")
+            bias_cbar.set_label(f"{target_name} bias")
+
+        fig.savefig(output_dir / f"time_height_evolution_{target_name}.png", dpi=plot_dpi)
+        plt.close(fig)
 
 
 def write_profile_diagnostics_netcdf(

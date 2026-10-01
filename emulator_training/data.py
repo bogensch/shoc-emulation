@@ -18,6 +18,8 @@ DERIVED_FEATURES = {
     "dv_wind_dz",
 }
 
+LOG1P_NONNEGATIVE_TOLERANCE = 1.0e-6
+
 
 @dataclass
 class SplitArrays:
@@ -759,9 +761,15 @@ def forward_target_transform(values: np.ndarray, transform_name: str) -> np.ndar
     if transform_name == "standardize":
         return values.astype(np.float32)
     if transform_name == "log1p_standardize":
-        if np.any(values < 0.0):
-            raise ValueError("log1p_standardize requires nonnegative target values.")
-        return np.log1p(values).astype(np.float32)
+        values = values.astype(np.float32, copy=False)
+        min_value = float(np.min(values))
+        if min_value < -LOG1P_NONNEGATIVE_TOLERANCE:
+            raise ValueError(
+                "log1p_standardize requires nonnegative target values. "
+                f"Found minimum value {min_value:.6e}, which is below the clipping tolerance "
+                f"{LOG1P_NONNEGATIVE_TOLERANCE:.1e}."
+            )
+        return np.log1p(np.clip(values, a_min=0.0, a_max=None)).astype(np.float32)
     raise KeyError(f"Unsupported target transform {transform_name!r}.")
 
 

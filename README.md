@@ -148,6 +148,7 @@ Artifacts are written under `outputs/` and include:
 - split metadata including the resolved train/validation/test day lists
 - training history plot
 - mean vertical profile plots for train/validation/test
+- time-height evolution plots for train/validation/test (`time_height_evolution_<target>.png`)
 - vertical-profile diagnostics in NetCDF form (`vertical_profile_diagnostics.nc`)
 - validation-set permutation importance in JSON form (`feature_importance.json`)
 - permutation-importance ranking plot (`feature_permutation_importance.png`)
