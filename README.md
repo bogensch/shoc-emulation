@@ -1,16 +1,7 @@
-# CASS Training Emulator
+# SHOC Turbulence Training Emulator
 
-This repository now contains a PyTorch training pipeline for the
-coarse-grained CASS emulator problem described in
-`GENESIS_CASS_ML_CONTEXT.md`.
-
-Current defaults match the constraints you gave:
-
-- targets are only `w_prime_2` and `w_prime_3`
-- `ustar` is not used as an input
-- TKE is not used as an input
-- resolved coarse-grid `w_wind` is also excluded by default so the first
-  baseline relies on the mean thermodynamic and horizontal-wind state
+This repository now contains a PyTorch training pipeline originally designed
+for the coarse-grained LES emulator problem.
 
 ## Files
 
@@ -32,7 +23,6 @@ Direct 3-D predictors:
 - `pressure`
 - `u_wind`
 - `v_wind`
-- `c_frac`
 
 Broadcast 2-D predictors:
 
