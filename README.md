@@ -1,7 +1,7 @@
 # SHOC Turbulence Training Emulator
 
-This repository now contains a PyTorch training pipeline originally designed
-for the coarse-grained LES emulator problem.
+This repository contains a PyTorch training pipeline designed
+for the coarse-grained LES turbulence emulator problem.
 
 ## Files
 
