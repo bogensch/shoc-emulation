@@ -16,9 +16,11 @@ DERIVED_FEATURES = {
     "dqt_dz",
     "du_wind_dz",
     "dv_wind_dz",
+    "cf_binary",
 }
 
 LOG1P_NONNEGATIVE_TOLERANCE = 1.0e-6
+CF_BINARY_QC_THRESHOLD = 1.0e-5
 
 
 @dataclass
@@ -648,6 +650,10 @@ def build_derived_feature(inputs: xr.Dataset, name: str) -> np.ndarray:
         return vertical_gradient(inputs["u_wind"].values, height)
     if name == "dv_wind_dz":
         return vertical_gradient(inputs["v_wind"].values, height)
+    if name == "cf_binary":
+        if "qc" not in inputs:
+            raise KeyError("Derived predictor 'cf_binary' requires 'qc' to be present in the inputs dataset.")
+        return (inputs["qc"].values.astype(np.float32, copy=False) >= CF_BINARY_QC_THRESHOLD).astype(np.float32)
     raise KeyError(f"Unsupported derived predictor {name!r}.")
 
 

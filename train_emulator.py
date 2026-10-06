@@ -140,7 +140,7 @@ def main() -> None:
         yaml.safe_dump(config, handle, sort_keys=False)
 
     if not args.disable_plots:
-        create_plots(output_dir, history, metrics, profile_diagnostics, importance_results, data.target_names)
+        create_plots(output_dir, history, metrics, profile_diagnostics, importance_results, data, predictions)
 
     print(f"Training complete. Artifacts written to {output_dir}")
     for split_name, split_metrics in metrics.items():
@@ -589,12 +589,14 @@ def create_plots(
     metrics: dict[str, dict[str, dict[str, float]]],
     profile_diagnostics: dict[str, dict[str, np.ndarray]],
     importance_results: dict[str, Any],
-    target_names: list[str],
+    data: PreparedData,
+    predictions: dict[str, np.ndarray],
 ) -> None:
     os.environ.setdefault("MPLCONFIGDIR", str(output_dir / ".mplconfig"))
     import matplotlib.pyplot as plt
 
     plot_dpi = 120
+    target_names = data.target_names
 
     fig, ax = plt.subplots(figsize=(5.8, 3.2))
     ax.plot(history["train_loss"], label="train")
@@ -703,8 +705,15 @@ def create_plots(
     fig.savefig(output_dir / "vertical_profile_errors_train_val_test.png", dpi=plot_dpi)
     plt.close(fig)
 
-    time_height_diagnostics = build_time_height_diagnostics(profile_diagnostics, target_names)
+    time_height_diagnostics = build_time_height_diagnostics(profile_diagnostics, target_names, max_height_m=6000.0)
     create_time_height_plots(output_dir, time_height_diagnostics, target_names, plot_dpi)
+    test_day_time_height_diagnostics = build_test_day_time_height_diagnostics(
+        data=data,
+        predictions=predictions,
+        target_names=target_names,
+        max_height_m=6000.0,
+    )
+    create_test_day_time_height_plots(output_dir, test_day_time_height_diagnostics, target_names, plot_dpi)
 
     if importance_results.get("enabled", False):
         feature_names = importance_results["feature_names"]
@@ -894,6 +903,7 @@ def aggregate_pointwise_time_height_fields(
 def build_time_height_diagnostics(
     profile_diagnostics: dict[str, dict[str, np.ndarray]],
     target_names: list[str],
+    max_height_m: float | None = None,
 ) -> dict[str, Any]:
     split_names = [split_name for split_name in ("train", "val", "test") if split_name in profile_diagnostics]
     by_target: dict[str, dict[str, dict[str, np.ndarray]]] = {}
@@ -905,12 +915,24 @@ def build_time_height_diagnostics(
 
         for split_name in split_names:
             diag = profile_diagnostics[split_name]
-            truth_field = diag["truth_time_height"][..., target_idx]
-            prediction_field = diag["prediction_time_height"][..., target_idx]
-            bias_field = diag["bias_time_height"][..., target_idx]
+            height_m, truth_field = select_and_sort_height_window(
+                diag["height_m"],
+                diag["truth_time_height"][..., target_idx],
+                max_height_m=max_height_m,
+            )
+            _, prediction_field = select_and_sort_height_window(
+                diag["height_m"],
+                diag["prediction_time_height"][..., target_idx],
+                max_height_m=max_height_m,
+            )
+            _, bias_field = select_and_sort_height_window(
+                diag["height_m"],
+                diag["bias_time_height"][..., target_idx],
+                max_height_m=max_height_m,
+            )
             target_entry[split_name] = {
                 "time_hours": diag["time_hours"].astype(np.float32),
-                "height_m": diag["height_m"].astype(np.float32),
+                "height_m": height_m.astype(np.float32),
                 "truth": truth_field.astype(np.float32),
                 "prediction": prediction_field.astype(np.float32),
                 "bias": bias_field.astype(np.float32),
@@ -945,6 +967,130 @@ def build_time_height_diagnostics(
         }
 
     return {"split_names": split_names, "by_target": by_target}
+
+
+def build_test_day_time_height_diagnostics(
+    data: PreparedData,
+    predictions: dict[str, np.ndarray],
+    target_names: list[str],
+    max_height_m: float | None = None,
+) -> dict[str, Any]:
+    split = data.test
+    if "day_name" not in split.coords:
+        return {"day_names": [], "by_target": {}}
+
+    sample_mode = data.metadata["sample_mode"]
+    day_names = np.asarray(split.coords["day_name"])
+    test_prediction = predictions["test"]
+    unique_days = list(dict.fromkeys(day_names.tolist()))
+    by_target: dict[str, dict[str, Any]] = {}
+
+    for target_idx, target_name in enumerate(target_names):
+        rows: list[dict[str, np.ndarray]] = []
+        common_range_values: list[np.ndarray] = []
+        bias_range_values: list[np.ndarray] = []
+
+        for day_name in unique_days:
+            day_mask = day_names == day_name
+            if not np.any(day_mask):
+                continue
+
+            day_truth = split.targets_raw[day_mask]
+            day_prediction = test_prediction[day_mask]
+
+            if sample_mode == "column":
+                aggregated = aggregate_column_time_height_fields(
+                    truth=day_truth,
+                    prediction=day_prediction,
+                    time_index=split.coords["time_index"][day_mask].astype(np.int32),
+                    time_hours=split.coords["time_hours"][day_mask].astype(np.float32),
+                )
+            elif sample_mode == "pointwise":
+                aggregated = aggregate_pointwise_time_height_fields(
+                    truth=day_truth,
+                    prediction=day_prediction,
+                    time_index=split.coords["time_index"][day_mask].astype(np.int32),
+                    time_hours=split.coords["time_hours"][day_mask].astype(np.float32),
+                    z_index=split.coords["z_index"][day_mask].astype(np.int32),
+                    num_levels=len(data.metadata["height_levels_m"]),
+                )
+            else:
+                raise ValueError(f"Unsupported sample_mode {sample_mode!r}.")
+
+            height_m, truth_field = select_and_sort_height_window(
+                np.asarray(data.metadata["height_levels_m"], dtype=np.float32),
+                aggregated["truth_mean"][..., target_idx],
+                max_height_m=max_height_m,
+            )
+            _, prediction_field = select_and_sort_height_window(
+                np.asarray(data.metadata["height_levels_m"], dtype=np.float32),
+                aggregated["prediction_mean"][..., target_idx],
+                max_height_m=max_height_m,
+            )
+            _, bias_field = select_and_sort_height_window(
+                np.asarray(data.metadata["height_levels_m"], dtype=np.float32),
+                aggregated["bias_mean"][..., target_idx],
+                max_height_m=max_height_m,
+            )
+
+            rows.append(
+                {
+                    "day_name": str(day_name),
+                    "time_hours": aggregated["time_hours"].astype(np.float32),
+                    "height_m": height_m.astype(np.float32),
+                    "truth": truth_field.astype(np.float32),
+                    "prediction": prediction_field.astype(np.float32),
+                    "bias": bias_field.astype(np.float32),
+                }
+            )
+            common_range_values.extend([truth_field[np.isfinite(truth_field)], prediction_field[np.isfinite(prediction_field)]])
+            bias_range_values.append(bias_field[np.isfinite(bias_field)])
+
+        common_values = np.concatenate([values for values in common_range_values if values.size > 0]) if common_range_values else np.asarray([], dtype=np.float32)
+        bias_values = np.concatenate([values for values in bias_range_values if values.size > 0]) if bias_range_values else np.asarray([], dtype=np.float32)
+
+        if common_values.size > 0:
+            common_vmin = float(np.min(common_values))
+            common_vmax = float(np.max(common_values))
+            if np.isclose(common_vmin, common_vmax):
+                common_vmax = common_vmin + 1.0e-6
+        else:
+            common_vmin, common_vmax = 0.0, 1.0
+
+        if bias_values.size > 0:
+            bias_abs = float(np.max(np.abs(bias_values)))
+            if np.isclose(bias_abs, 0.0):
+                bias_abs = 1.0e-6
+        else:
+            bias_abs = 1.0
+
+        by_target[target_name] = {
+            "rows": rows,
+            "common_vmin": common_vmin,
+            "common_vmax": common_vmax,
+            "bias_vmin": -bias_abs,
+            "bias_vmax": bias_abs,
+        }
+
+    return {"day_names": unique_days, "by_target": by_target}
+
+
+def select_and_sort_height_window(
+    height_m: np.ndarray,
+    field: np.ndarray,
+    max_height_m: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    height_m = np.asarray(height_m, dtype=np.float32)
+    field = np.asarray(field, dtype=np.float32)
+
+    if max_height_m is not None:
+        mask = height_m <= max_height_m
+        if np.any(mask):
+            height_m = height_m[mask]
+            field = field[:, mask]
+
+    order = np.argsort(height_m)
+    return height_m[order], field[:, order]
 
 
 def create_time_height_plots(
@@ -1030,6 +1176,95 @@ def create_time_height_plots(
             bias_cbar.set_label(f"{target_name} bias")
 
         fig.savefig(output_dir / f"time_height_evolution_{target_name}.png", dpi=plot_dpi)
+        plt.close(fig)
+
+
+def create_test_day_time_height_plots(
+    output_dir: Path,
+    test_day_time_height_diagnostics: dict[str, Any],
+    target_names: list[str],
+    plot_dpi: int,
+) -> None:
+    os.environ.setdefault("MPLCONFIGDIR", str(output_dir / ".mplconfig"))
+    import matplotlib.pyplot as plt
+
+    column_specs = (
+        ("truth", "Target"),
+        ("prediction", "ML"),
+        ("bias", "ML - target"),
+    )
+
+    for target_name in target_names:
+        target_diag = test_day_time_height_diagnostics["by_target"].get(target_name, {})
+        rows = target_diag.get("rows", [])
+        if not rows:
+            continue
+
+        fig, axes = plt.subplots(
+            len(rows),
+            len(column_specs),
+            figsize=(10.0, 2.3 * len(rows)),
+            sharex=False,
+            sharey=True,
+            constrained_layout=False,
+        )
+        if len(rows) == 1:
+            axes = np.array([axes])
+
+        common_mappable = None
+        bias_mappable = None
+
+        for row_idx, row in enumerate(rows):
+            time_hours = row["time_hours"]
+            height_m = row["height_m"]
+            time_grid, height_grid = np.meshgrid(time_hours, height_m, indexing="xy")
+            day_label = row["day_name"]
+
+            for col_idx, (field_name, title) in enumerate(column_specs):
+                ax = axes[row_idx, col_idx]
+                field = row[field_name].T
+                if field_name == "bias":
+                    mappable = ax.pcolormesh(
+                        time_grid,
+                        height_grid,
+                        field,
+                        shading="auto",
+                        cmap="RdBu_r",
+                        vmin=target_diag["bias_vmin"],
+                        vmax=target_diag["bias_vmax"],
+                    )
+                    bias_mappable = mappable
+                else:
+                    mappable = ax.pcolormesh(
+                        time_grid,
+                        height_grid,
+                        field,
+                        shading="auto",
+                        cmap="viridis",
+                        vmin=target_diag["common_vmin"],
+                        vmax=target_diag["common_vmax"],
+                    )
+                    common_mappable = mappable
+
+                if row_idx == 0:
+                    ax.set_title(title, fontsize=10)
+                if col_idx == 0:
+                    ax.set_ylabel(f"{day_label}\nHeight (m)")
+                ax.set_xlabel("Time (hr)")
+
+        fig.suptitle(f"Test-Day Time Evolution up to 6 km: {target_name}", fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.08, 1.0, 0.97))
+
+        common_cax = fig.add_axes([0.12, 0.035, 0.50, 0.018])
+        bias_cax = fig.add_axes([0.70, 0.035, 0.20, 0.018])
+        if common_mappable is not None:
+            common_cbar = fig.colorbar(common_mappable, cax=common_cax, orientation="horizontal")
+            common_cbar.set_label(target_name)
+        if bias_mappable is not None:
+            bias_cbar = fig.colorbar(bias_mappable, cax=bias_cax, orientation="horizontal")
+            bias_cbar.set_label(f"{target_name} bias")
+
+        fig.savefig(output_dir / f"time_height_evolution_test_days_{target_name}.png", dpi=plot_dpi)
         plt.close(fig)
 
 

@@ -1,23 +1,23 @@
-experiment_name: cass_w2_w3_column_context
+experiment_name: cass_w2w3_kernel7_splitseed7
 
 data:
   sample_mode: column
   ensemble_root: /p/lustre5/bogensch/ERF_shcu_ensemble
   case_prefix: shcu_50m_
-  post_processed_subdir: post_processed_output
-  input_filename: training_inputs_coarse_grained.3.2km.nc
-  target_filename: training_targets_coarse_grained_3.2km.nc
+  post_processed_subdir: post_processed_output/training_data_height_adjusted
+  input_filename: training_inputs_coarse_grained.3.2km.zadjust.nc
+  target_filename: training_targets_coarse_grained_3.2km.zadjust.nc
   # Optional controls for curating the day set:
   #days: [19000101, 19000102, 19000103]
   exclude_days: []
   predictor_3d:
     - theta_liq
     - qt
-    - qc
     - rho
     - pressure
     - u_wind
     - v_wind
+    - qc
   predictor_2d:
     - shf
     - lhf
