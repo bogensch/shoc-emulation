@@ -133,7 +133,8 @@ Artifacts are written under `outputs/` and include:
 - trained checkpoint
 - resolved config
 - normalization metadata
-- standalone NumPy emulator implementation (`standalone_emulator.py`)
+- standalone emulator wrapper (`standalone_emulator.py`)
+- standalone emulator weights (`standalone_emulator.pt`)
 - scalar metrics
 - split metadata including the resolved train/validation/test day lists
 - training history plot
